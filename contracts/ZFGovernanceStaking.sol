@@ -33,27 +33,29 @@ contract ZFGovernanceStaking is yZFToken, ReentrancyGuard, Ownable {
     uint256 public constant PRECISION = 1e12;
     uint256 public constant MAX_FEE = 1e11; // 10%
     uint256 public constant MAX_ALLOCATION_RATIO = 1e12; // 100%
+    uint256 public constant MAX_REWARD_RATE = 0.528 ether;
 
     address private constant ZERO_ADDRESS = address(0);
 
     address immutable public zfToken;
     uint256 public startTime;
-    uint256 public endTime;
+    uint256 public endTime = 1788220799;
     uint256 public zfLastRewardTime;
     uint256 public zfRewardRate;
 
     constructor(
         address token,
         uint256 startTimestamp,
-        uint256 endTimestamp,
         uint256 zfPersecond 
     )
         yZFToken()
     {
         require(token != ZERO_ADDRESS, "Illegal token address");
+        require(startTimestamp < endTime, "invalid startTime");
+        require(zfPersecond <= MAX_REWARD_RATE, "invalid reward rate");
+
         zfToken = token;
         startTime = startTimestamp;
-        endTime = endTimestamp;
         zfLastRewardTime = startTimestamp;
         zfRewardRate = zfPersecond;
     }
@@ -67,7 +69,6 @@ contract ZFGovernanceStaking is yZFToken, ReentrancyGuard, Ownable {
 
     event SetPenaltyPercent(uint256 newFee);
     event SetStartTime(uint256 startTime);
-    event SetEndTime(uint256 endTime);
     event SetRewardRate(uint256 newRewardRate);
 
 
@@ -133,9 +134,11 @@ contract ZFGovernanceStaking is yZFToken, ReentrancyGuard, Ownable {
             shares = amount * totalSupply / poolBalance;
         }
 
+        require(shares != 0, "stake: shares is zero");
+
         // Stake ZF, receive yZF
-        IERC20(zfToken).safeTransferFrom(msg.sender, address(this), amount);
         _mint(msg.sender, shares);
+        IERC20(zfToken).safeTransferFrom(msg.sender, address(this), amount);
 
         emit Stake(msg.sender, amount, shares);
 
@@ -167,6 +170,7 @@ contract ZFGovernanceStaking is yZFToken, ReentrancyGuard, Ownable {
         // unstake ZF
         _burn(msg.sender, shares);
         IERC20(zfToken).safeTransfer(msg.sender, withdrawAmount);
+
         emit Unstake(msg.sender, withdrawAmount, shares);
 
         // update the staked amount of the user
@@ -219,11 +223,14 @@ contract ZFGovernanceStaking is yZFToken, ReentrancyGuard, Ownable {
     // Set penalty allocation for a penalty destination.
     function setPenaltyAllocation(uint256 idx, address dst, uint256 allocation) external onlyOwner {
         require (dst != ZERO_ADDRESS, "setPenaltyAllocation:Illegal destination address");
-        require(allocation <= MAX_ALLOCATION_RATIO, "setPenaltyAllocation:invalid allocation");
+
 
         PenaltyInfo storage penaltyInfo = penaltyList[idx];
         penaltyInfo.desAddress = dst;
         penaltyInfo.allocation = allocation;
+
+        uint256 totalAllocation = getTotalAllocation();
+        require(totalAllocation <= MAX_ALLOCATION_RATIO, "setPenaltyAllocation: invalid allocation");
 
         emit SetPenaltyAllocation(idx, dst, allocation);
     }
@@ -231,28 +238,35 @@ contract ZFGovernanceStaking is yZFToken, ReentrancyGuard, Ownable {
     // Add new penalty penalty destination and its allocation.
     function addPenaltyAllocation(address dst, uint256 allocation) external onlyOwner {
         require(dst!= ZERO_ADDRESS, "addPenaltyAllocation: Illegal destination address");
-        require(allocation <= MAX_ALLOCATION_RATIO, "addPenaltyAllocation: invalid allocation");
 
         penaltyList.push(PenaltyInfo({
             desAddress: dst,
             allocation: allocation
         }));
+        
+        uint256 totalAllocation = getTotalAllocation();
+        require(totalAllocation <= MAX_ALLOCATION_RATIO, "addPenaltyAllocation: invalid allocation");
+
         emit AddPenaltyAllocation(dst, allocation);
+    }
+
+    function getTotalAllocation() internal view returns (uint256 totalAllocation) {
+        totalAllocation = 0;
+        for (uint256 i=0; i < penaltyList.length;)  {
+            PenaltyInfo memory penaltyInfo = penaltyList[i];
+
+            totalAllocation += penaltyInfo.allocation;
+            unchecked {
+                ++i;
+            }
+        }
     }
 
     // Remove a penalty destination and its allocation.
     function removePenaltyAllocation(uint256 pid) external onlyOwner {
         require(pid < penaltyList.length, "removePenaltyAllocation: invalid penalty index");
-
-        if (pid < (penaltyList.length - 1)) {
-            for (uint256 i = pid; i < penaltyList.length; ) {
-                penaltyList[i] = penaltyList[i + 1];
-                unchecked {
-                    ++i;
-                }
-            }
-        }
-
+        
+        penaltyList[pid] = penaltyList[penaltyList.length - 1];
         penaltyList.pop();
         emit RemovePenaltyAllocation(pid);
     }
@@ -266,21 +280,24 @@ contract ZFGovernanceStaking is yZFToken, ReentrancyGuard, Ownable {
 
     // Set the start time of the staking period.
     function setStartTime(uint256 startTimestamp) external onlyOwner {
+        require(startTimestamp < endTime, "setStartTime: invalid startTimestamp");
         startTime = startTimestamp;
         zfLastRewardTime = startTimestamp;
 
         emit SetStartTime(startTimestamp);
     }
 
-    // Set the end time of the staking period.
-    function setEndTime(uint256 endTimestamp) external onlyOwner {
-        endTime = endTimestamp;
-
-        emit SetStartTime(endTimestamp);
-    }
 
     // Set the ZF reward rate (per second).
     function setRewardRate(uint256 newRewardRate) external onlyOwner {
+        require(newRewardRate <= MAX_REWARD_RATE, "setRewardRate: max rewardRate");
+
+        // Harvest ZF
+        uint256 pendingAmount = pendingZF();
+        if (pendingAmount > 0) {
+            IZFToken(zfToken).mint(address(this), pendingAmount);
+        }
+        zfLastRewardTime = block.timestamp;
         zfRewardRate = newRewardRate;
 
         emit SetRewardRate(newRewardRate);
